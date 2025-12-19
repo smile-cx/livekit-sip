@@ -142,3 +142,5 @@ require (
 	google.golang.org/grpc v1.76.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
+
+replace github.com/livekit/media-sdk => github.com/smile-cx/livekit-media-sdk v0.0.0-20251219084209-ea05776afef9

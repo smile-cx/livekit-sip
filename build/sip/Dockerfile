@@ -21,7 +21,7 @@ ARG TARGETPLATFORM
 WORKDIR /workspace
 
 # install libopus
-RUN apt-get update && apt-get install -y pkg-config libopus-dev libopusfile-dev libsoxr-dev
+RUN apt-get update && apt-get install -y pkg-config libopus-dev libopusfile-dev libsoxr-dev libbcg729-dev
 
 # download go modules
 COPY go.mod .
@@ -42,7 +42,7 @@ FROM golang:$GOVERSION
 
 # install wget for health check
 RUN apt-get update && \
-    apt-get install -y libopus0 libopusfile0 libsoxr0 && \
+    apt-get install -y libopus0 libopusfile0 libsoxr0 libbcg729-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
