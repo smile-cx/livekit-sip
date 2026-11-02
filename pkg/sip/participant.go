@@ -119,6 +119,8 @@ func (v CallStatus) Attribute() string {
 		return "dialing"
 	case CallRinging:
 		return "ringing"
+	case CallEarlyMedia:
+		return "early_media"
 	case CallAutomation:
 		return "automation"
 	case CallActive:
@@ -143,4 +145,5 @@ const (
 	callAcceptFailed
 	callNoACK
 	callHangupMedia
+	CallEarlyMedia
 )

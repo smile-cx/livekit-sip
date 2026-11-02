@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"mime"
 	"net"
 	"sort"
 	"strconv"
@@ -532,15 +533,22 @@ func (c *outboundCall) connectToRoom(ctx context.Context, lkNew RoomConfig, getR
 }
 
 func (c *outboundCall) dialSIP(ctx context.Context) error {
+	stopDialtone := func() {}
 	if ringback := dialtoneTones(c.sipConf.dialtone); ringback != nil {
 		const ringVolume = math.MaxInt16 / 2
 		rctx, rcancel := context.WithCancel(ctx)
-		defer rcancel()
+		done := make(chan struct{})
+		stopDialtone = func() {
+			rcancel()
+			<-done
+		}
+		defer stopDialtone()
 
 		dst := c.lkRoomIn // already under mutex
 
 		// Play dialtone to the room while participant connects
 		go func() {
+			defer close(done)
 			rctx, span := Tracer.Start(rctx, "tones.Play")
 			defer span.End()
 
@@ -554,7 +562,7 @@ func (c *outboundCall) dialSIP(ctx context.Context) error {
 			}
 		}()
 	}
-	err := c.sipSignal(ctx)
+	err := c.sipSignal(ctx, stopDialtone)
 	if err != nil {
 		return err
 	}
@@ -596,18 +604,7 @@ func (c *outboundCall) connectMedia() {
 		c.log().Warnw("room has unexpected outbound DTMF writer", nil)
 	}
 
-	if processor := c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: RoomSampleRate}); processor != nil {
-		c.lkRoomIn = processor(c.lkRoomIn)
-	}
-
-	if old := c.media.WriteInboundAudioTo(c.lkRoomIn); old != nil {
-		old.Close()
-		c.log().Warnw("media port has unexpected inbound audio writer", nil)
-	}
-
-	// WriteInboundAudioTo takes ownership of c.lkRoomIn, so nil it out to avoid
-	// double-closing later.
-	c.lkRoomIn = nil
+	c.connectInboundAudio()
 
 	rate := 8000
 	if mc := c.media.NegotiatedAudio(); mc != nil {
@@ -621,7 +618,22 @@ func (c *outboundCall) connectMedia() {
 	}
 }
 
-type sipRespFunc func(code sip.StatusCode, hdrs Headers)
+func (c *outboundCall) connectInboundAudio() {
+	if c.lkRoomIn == nil {
+		return // already connected by early media
+	}
+	if processor := c.c.handler.GetMediaProcessor(c.sipConf.enabledFeatures, c.sipConf.featureFlags, string(c.cc.ID()), MediaProcessorOpts{InputSampleRate: RoomSampleRate}); processor != nil {
+		c.lkRoomIn = processor(c.lkRoomIn)
+	}
+	if old := c.media.WriteInboundAudioTo(c.lkRoomIn); old != nil {
+		old.Close()
+		c.log().Warnw("media port has unexpected inbound audio writer", nil)
+	}
+	// The media port owns this writer from now on, including its Close.
+	c.lkRoomIn = nil
+}
+
+type sipRespFunc func(res *sip.Response) error
 
 func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan struct{}, setState sipRespFunc) (*sip.Response, error) {
 	cnt := 0
@@ -643,7 +655,10 @@ func sipResponse(ctx context.Context, tx sip.ClientTransaction, stop <-chan stru
 			}
 			status := res.StatusCode
 			if setState != nil {
-				setState(res.StatusCode, res.Headers())
+				if err := setState(res); err != nil {
+					_ = tx.Cancel()
+					return nil, err
+				}
 			}
 			if status/100 != 1 { // != 1xx
 				return res, nil
@@ -740,7 +755,7 @@ func (c *outboundCall) setExtraAttrs(hdrToAttr map[string]string, opts livekit.S
 	}
 }
 
-func (c *outboundCall) sipSignal(ctx context.Context) error {
+func (c *outboundCall) sipSignal(ctx context.Context, stopDialtone func()) error {
 	ctx, span := Tracer.Start(ctx, "sip.outbound.sipSignal")
 	defer span.End()
 
@@ -777,9 +792,12 @@ func (c *outboundCall) sipSignal(ctx context.Context) error {
 	c.sessionDur = c.mon.SessionDur()
 
 	ringing := false
-	sdpResp, err := c.cc.Invite(ctx, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(code sip.StatusCode, hdrs Headers) {
+	var earlyResp, finalResp *sip.Response
+	sdpResp, err := c.cc.Invite(ctx, c.sipConf.user, c.sipConf.pass, c.sipConf.headers, sdpOfferData, func(res *sip.Response) error {
+		code := res.StatusCode
 		if code == sip.StatusOK {
-			return // is set separately
+			finalResp = res
+			return nil // is set separately
 		}
 		if code == sip.StatusTrying && c.sigTs.TryingTime.IsZero() {
 			c.sigTs.TryingTime = time.Now()
@@ -787,9 +805,41 @@ func (c *outboundCall) sipSignal(ctx context.Context) error {
 		if !ringing && code >= sip.StatusRinging && code < sip.StatusOK {
 			ringing = true
 			c.sigTs.RingingTime = time.Now()
-			c.setStatus(CallRinging)
+			defer func() {
+				if earlyResp == nil {
+					c.setStatus(CallRinging)
+				}
+			}()
 		}
-		c.setExtraAttrs(nil, 0, nil, hdrs)
+		c.setExtraAttrs(nil, 0, nil, res.Headers())
+		if code != sip.StatusSessionInProgress {
+			return nil
+		}
+		h := res.GetHeader("Content-Type")
+		if h == nil || len(res.Body()) == 0 {
+			c.log().Debugw("ignoring 183 without SDP")
+			return nil
+		}
+		contentType, _, err := mime.ParseMediaType(h.Value())
+		if err != nil || contentType != "application/sdp" {
+			c.log().Debugw("ignoring 183 with non-SDP content type", "contentType", h.Value())
+			return nil
+		}
+		if err := c.media.ProcessEarlyAnswer(res.Body()); err != nil {
+			var sdpErr SDPError
+			if errors.As(err, &sdpErr) {
+				c.log().Warnw("ignoring invalid early media SDP", err)
+				return nil
+			}
+			return fmt.Errorf("early media setup failed: %w", err)
+		}
+		stopDialtone()
+		c.connectInboundAudio()
+		if earlyResp == nil {
+			c.setStatus(CallEarlyMedia)
+		}
+		earlyResp = res
+		return nil
 	})
 	// Update SIPCallInfo with the SIP Call-ID after Invite
 	if sipCallID := c.cc.SIPCallID(); sipCallID != "" {
@@ -823,11 +873,6 @@ func (c *outboundCall) sipSignal(ctx context.Context) error {
 
 	c.setLog(LoggerWithHeaders(c.log(), c.cc))
 
-	err = c.media.ProcessAnswer(sdpResp)
-	if err != nil {
-		return err
-	}
-
 	c.mon.InviteAccept()
 	err = c.cc.AckInviteOK(ctx)
 	if err != nil {
@@ -835,6 +880,12 @@ func (c *outboundCall) sipSignal(ctx context.Context) error {
 		return err
 	}
 	c.sigTs.AckTime = time.Now()
+	if len(sdpResp) == 0 && sameInviteDialog(earlyResp, finalResp) {
+		sdpResp = earlyResp.Body()
+	}
+	if err := c.media.ProcessAnswer(sdpResp); err != nil {
+		return err
+	}
 	joinDur()
 
 	if ctx.Err() != nil {
@@ -865,6 +916,14 @@ func (c *outboundCall) sipSignal(ctx context.Context) error {
 	})
 
 	return nil
+}
+
+func sameInviteDialog(a, b *sip.Response) bool {
+	if a == nil || b == nil || a.To() == nil || b.To() == nil || a.CSeq() == nil || b.CSeq() == nil {
+		return false
+	}
+	tag, ok := a.To().Params.Get("tag")
+	return ok && tag != "" && tag == b.To().Params.GetOr("tag", "") && a.CSeq().SeqNo == b.CSeq().SeqNo
 }
 
 func (c *outboundCall) transferCall(ctx context.Context, transferTo string, headers map[string]string, dialtone livekit.SIPDialtone) (transferID string, retErr error) {
@@ -1307,7 +1366,7 @@ func (c *sipOutbound) attemptInvite(ctx context.Context, callID sip.CallIDHeader
 	}
 
 	resp, err := sipResponse(ctx, tx, c.c.closing.Watch(), setState)
-	if err != nil && resp == nil && (ctx.Err() != nil || c.c.closing.IsBroken()) {
+	if err != nil && resp == nil {
 		// Cancelled: return now, but watch for a racing 2xx in the background.
 		handedOff = true
 		go watchCancelledInvite(c.log, c.c.sipCli, c.getHeaders, req, tx)

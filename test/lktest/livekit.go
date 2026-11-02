@@ -116,13 +116,13 @@ func (lk *LiveKit) CreateSIPParticipantSync(t TB, req *livekit.CreateSIPParticip
 func (lk *LiveKit) Connect(t TB, room, identity string, cb *lksdk.RoomCallback) *lksdk.Room {
 	lksdk.SetLogger(logger.NewTestLogger(t))
 	r := lksdk.NewRoom(cb)
-	// faster connection timeout since they should be in the same DC
+	// Allow ICE/DTLS setup to finish on slower Docker/CI hosts.
 	err := r.Join(lk.WsUrl, lksdk.ConnectInfo{
 		APIKey:              lk.ApiKey,
 		APISecret:           lk.ApiSecret,
 		RoomName:            room,
 		ParticipantIdentity: identity,
-	}, lksdk.WithConnectTimeout(1*time.Second))
+	}, lksdk.WithConnectTimeout(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

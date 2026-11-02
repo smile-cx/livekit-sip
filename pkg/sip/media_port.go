@@ -442,11 +442,14 @@ type MediaPort interface {
 	GenerateAnswer(offer []byte) ([]byte, error)
 
 	// ProcessAnswer processes an encoded SDP answer from the remote client. Returns an
-	// error if the answer is invalid, the offer has not yet been generated, or
-	// if media has already been negotiated.
+	// error if the answer is invalid or there is no pending local offer.
+	// Finalizes any early media negotiation and arms the media timeout.
 	//
 	// SIDE EFFECT: May cause a rebuild of the pipeline.
 	ProcessAnswer(answer []byte) error
+
+	// ProcessEarlyAnswer applies provisional SDP without consuming the offer or arming the media timeout.
+	ProcessEarlyAnswer(answer []byte) error
 
 	GetLocalSDP() ([]byte, error)
 
@@ -545,6 +548,7 @@ type mediaPort struct {
 	localSDP   []byte
 	offer      *sdp.Offer
 	negotiated *sdp.MediaConfig
+	earlyMedia bool
 
 	audioIn  *msdk.WriteCloserSwitch[msdk.PCM16Sample] // SIP RTP -> LK PCM
 	audioOut *msdk.WriteCloserSwitch[msdk.PCM16Sample] // LK PCM -> SIP RTP
@@ -815,7 +819,7 @@ func (p *mediaPort) GenerateAnswer(offerData []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = p.configure(mc, answerData)
+	err = p.configure(mc, answerData, false)
 	if err != nil {
 		return nil, err
 	}
@@ -823,6 +827,14 @@ func (p *mediaPort) GenerateAnswer(offerData []byte) ([]byte, error) {
 }
 
 func (p *mediaPort) ProcessAnswer(answerData []byte) error {
+	return p.processAnswer(answerData, false)
+}
+
+func (p *mediaPort) ProcessEarlyAnswer(answerData []byte) error {
+	return p.processAnswer(answerData, true)
+}
+
+func (p *mediaPort) processAnswer(answerData []byte, early bool) error {
 	if len(answerData) == 0 {
 		return errors.New("no answer provided")
 	}
@@ -849,11 +861,13 @@ func (p *mediaPort) ProcessAnswer(answerData []byte) error {
 		return err
 	}
 
-	err = p.configure(mc, localSDPBytes)
+	err = p.configure(mc, localSDPBytes, early)
 	if err != nil {
 		return err
 	}
-	p.SetTimeout(p.opts.MediaTimeoutInitial, p.opts.MediaTimeout)
+	if !early {
+		p.SetTimeout(p.opts.MediaTimeoutInitial, p.opts.MediaTimeout)
+	}
 	return nil
 }
 
@@ -906,7 +920,7 @@ func parseAnswerWith(log logger.Logger, mon *stats.CallMonitor, codecs *msdk.Cod
 
 // Building pipeline
 
-func (p *mediaPort) configure(c *sdp.MediaConfig, localSDP []byte) error {
+func (p *mediaPort) configure(c *sdp.MediaConfig, localSDP []byte, early bool) error {
 	// Map the durable udpConn + WriteCloserSwitch anchors onto a fresh mediaPortPipeline.
 	// Rebuild from scratch under mu: closePipelineLocked (soft-closes the session via udpConn),
 	// Reopen the port, then Configure a new generation and Swap TX leaves into the anchors.
@@ -918,10 +932,11 @@ func (p *mediaPort) configure(c *sdp.MediaConfig, localSDP []byte) error {
 	p.mu.Lock() // No concurrent rebuilding of the pipeline
 	defer p.mu.Unlock()
 
-	p.offer = nil
-
 	if p.closed.IsBroken() {
 		return errors.New("media is already closed")
+	}
+	if !early {
+		p.offer = nil
 	}
 
 	changeSetSummary := NewChangeSetSummary(p.negotiated, c)
@@ -963,7 +978,7 @@ func (p *mediaPort) configure(c *sdp.MediaConfig, localSDP []byte) error {
 		p.log.Infow("peer requested hold", "direction", c.PeerDirection.String(), "remote", c.Remote.String())
 	}
 	if changeSetSummary.shouldReconfigure() {
-		if changeSetSummary != changeSetNew {
+		if changeSetSummary != changeSetNew && !p.earlyMedia {
 			// Explicitly disable renegotiation for now
 			// Compatibility to today's behavior: return 200 OK, but don't reconfigure the pipeline
 			return nil
@@ -997,10 +1012,17 @@ func (p *mediaPort) configure(c *sdp.MediaConfig, localSDP []byte) error {
 
 		audioToPort, dtmfToPort = newPipeline.GetConnectors() // These are not propagating Close()
 		p.pipeline = newPipeline
-
-		p.localSDP = localSDP // TODO: Move to end of function when reconfiguring is supported
+		p.localSDP = localSDP
+	}
+	if p.earlyMedia && !early {
+		// Pre-answer packets must not spend the answered call's initial media window.
+		p.lastPacketTime.Store(0)
+	}
+	if p.earlyMedia {
+		p.localSDP = localSDP
 	}
 	p.negotiated = c
+	p.earlyMedia = early
 	return nil
 }
 
