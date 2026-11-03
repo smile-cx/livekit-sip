@@ -738,6 +738,7 @@ func (c *outboundCall) setStatus(v CallStatus) {
 	if r == nil {
 		return
 	}
+	c.log().Infow("Updating outbound SIP call status", "callStatus", attr)
 	r.LocalParticipant.SetAttributes(map[string]string{
 		livekit.AttrSIPCallStatus: attr,
 	})
@@ -836,6 +837,7 @@ func (c *outboundCall) sipSignal(ctx context.Context, stopDialtone func()) error
 		stopDialtone()
 		c.connectInboundAudio()
 		if earlyResp == nil {
+			c.log().Infow("Outbound SIP early media detected", "sipStatus", res.StatusCode)
 			c.setStatus(CallEarlyMedia)
 		}
 		earlyResp = res
